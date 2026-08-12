@@ -1,1 +1,32 @@
+name: Build Android APK
 
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Java JDK
+        uses: actions/setup-java@v3
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Build APK with Bubblewrap / TWA
+        run: |
+          npm install -g @bubblewrap/cli
+          echo "Building Web App to APK..."
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: BlockBlast-DanilaBest-APK
+          path: ./*.apk
+          
