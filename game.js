@@ -1,7 +1,7 @@
 /* ============================================================
    BLOCK BLAST ENGINE — Данила Щербаков — Лучший
-   Полноценный движок: сетка 8×8, drag-and-drop, линии,
-   комбо, частицы, магазин сплэшей, темы, обои.
+   v2: 3D-кубики, Web Audio синтез, спрайтовые частицы,
+   комбо-плашки, drag&drop на translate3d.
    ============================================================ */
 'use strict';
 
@@ -46,9 +46,30 @@ const store = {
   set(k, v) { try { localStorage.setItem('bb_' + k, JSON.stringify(v)); } catch (e) {} }
 };
 
+/* ---------- УТИЛИТЫ ЦВЕТА ---------- */
+const rnd = (a, b) => a + Math.random() * (b - a);
+const pick = arr => arr[(Math.random() * arr.length) | 0];
+
+function hexToRgb(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return [n >> 16, (n >> 8) & 255, n & 255];
+}
+function shade(hex, amt) { // amt: -1 (чернее) .. 1 (белее)
+  const [r, g, b] = hexToRgb(hex);
+  const t = amt > 0 ? 255 : 0, p = Math.abs(amt);
+  return `rgb(${Math.round(r + (t - r) * p)},${Math.round(g + (t - g) * p)},${Math.round(b + (t - b) * p)})`;
+}
+const SHADES = {};
+PALETTE.forEach(h => { SHADES[h] = { hex: h, light: shade(h, .45), dark: shade(h, -.32) }; });
+function gradOf(hex) {
+  const s = SHADES[hex] || (SHADES[hex] = { hex, light: shade(hex, .45), dark: shade(hex, -.32) });
+  return `linear-gradient(180deg, ${s.light} 0%, ${hex} 48%, ${s.dark} 100%)`;
+}
+
+function vibrate(ms) { if (navigator.vibrate) { try { navigator.vibrate(ms); } catch (e) {} } }
+
 /* ---------- СОСТОЯНИЕ ---------- */
-let grid = [];
-let cells = [];
+let grid = [], cells = [];
 let pieces = [null, null, null];
 let score = 0, best = 0, coins = 0, runCoins = 0, streak = 0;
 let theme = 'slate', splashId = 'fire';
@@ -57,34 +78,17 @@ let wallData = null;
 let boardOpen = false, shopOpen = false;
 let metrics = { left: 0, top: 0, cell: 0 };
 let drag = null;
-let shakeRaf = null, shakeMag = 0;
+let shakeRaf = null;
 
 /* ---------- DOM ---------- */
 const $ = id => document.getElementById(id);
 const body = document.body;
 const gridEl = $('grid'), previewLayer = $('previewLayer'), dragLayer = $('dragLayer');
-const boardWrap = $('boardWrap'), stage = $('stage'), comboPlate = $('comboPlate');
+const boardWrap = $('boardWrap'), boardInner = $('boardInner'), stage = $('stage');
+const comboPlate = $('comboPlate');
 const slots = [...document.querySelectorAll('.slot')];
 const fx = $('fx'), fxCtx = fx.getContext('2d');
 const toastEl = $('toast');
-
-/* ---------- УТИЛИТЫ ---------- */
-const rnd = (a, b) => a + Math.random() * (b - a);
-const pick = arr => arr[(Math.random() * arr.length) | 0];
-const lighten = hex => {
-  const n = parseInt(hex.slice(1), 16);
-  const r = Math.min(255, (n >> 16) + 60), g = Math.min(255, ((n >> 8) & 255) + 60), b = Math.min(255, (n & 255) + 60);
-  return `rgb(${r},${g},${b})`;
-};
-function vibrate(ms) { if (navigator.vibrate) { try { navigator.vibrate(ms); } catch (e) {} } }
-
-function pickWeighted() {
-  let total = 0;
-  for (const s of SHAPES) total += s.w;
-  let t = Math.random() * total;
-  for (const s of SHAPES) { t -= s.w; if (t <= 0) return s.m; }
-  return SHAPES[0].m;
-}
 
 let toastTimer = null;
 function toast(msg) {
@@ -94,8 +98,111 @@ function toast(msg) {
   toastTimer = setTimeout(() => toastEl.classList.remove('show'), 1900);
 }
 
-/* ---------- ЧАСТИЦЫ ---------- */
-const FX = { parts: [], last: 0 };
+/* ============================================================
+   ЗВУКОВОЙ ДВИЖОК — чистый Web Audio синтез, без файлов
+   ============================================================ */
+const Sound = (() => {
+  let ac = null, master = null, noiseBuf = null;
+
+  function ctx() {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    if (!ac) {
+      ac = new AC();
+      master = ac.createGain();
+      master.gain.value = .85;
+      master.connect(ac.destination);
+      noiseBuf = ac.createBuffer(1, (ac.sampleRate * .5) | 0, ac.sampleRate);
+      const d = noiseBuf.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    }
+    if (ac.state === 'suspended') ac.resume();
+    return ac;
+  }
+
+  function tone(o) {
+    const a = ctx(); if (!a) return;
+    const t0 = a.currentTime + (o.at || 0);
+    const osc = a.createOscillator();
+    osc.type = o.type || 'sine';
+    osc.frequency.setValueAtTime(o.f, t0);
+    if (o.f2) osc.frequency.exponentialRampToValueAtTime(Math.max(20, o.f2), t0 + (o.d || .2));
+    const g = a.createGain();
+    const atk = o.a || .008;
+    g.gain.setValueAtTime(.0001, t0);
+    g.gain.exponentialRampToValueAtTime(o.v || .25, t0 + atk);
+    g.gain.exponentialRampToValueAtTime(.0001, t0 + atk + (o.d || .2));
+    osc.connect(g);
+    let out = g;
+    if (o.lp) { const f = a.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = o.lp; out.connect(f); out = f; }
+    if (o.hp) { const f = a.createBiquadFilter(); f.type = 'highpass'; f.frequency.value = o.hp; out.connect(f); out = f; }
+    out.connect(master);
+    osc.start(t0); osc.stop(t0 + atk + (o.d || .2) + .06);
+  }
+
+  function noise(o) {
+    const a = ctx(); if (!a) return;
+    const t0 = a.currentTime + (o.at || 0);
+    const src = a.createBufferSource(); src.buffer = noiseBuf;
+    const g = a.createGain();
+    g.gain.setValueAtTime(.0001, t0);
+    g.gain.exponentialRampToValueAtTime(o.v || .2, t0 + .004);
+    g.gain.exponentialRampToValueAtTime(.0001, t0 + (o.d || .05));
+    src.connect(g);
+    const f = a.createBiquadFilter();
+    f.type = o.hp ? 'highpass' : 'lowpass';
+    f.frequency.value = o.f || 1000;
+    f.Q.value = .8;
+    g.connect(f); f.connect(master);
+    src.start(t0); src.stop(t0 + (o.d || .05) + .03);
+  }
+
+  return {
+    unlock() { ctx(); },
+    // 1) Взятие фигуры — короткий мягкий клик
+    pickup() {
+      tone({ type: 'triangle', f: 760, f2: 520, d: .06, v: .16 });
+      noise({ hp: true, f: 3200, d: .03, v: .07 });
+    },
+    // 2) Установка — плотный упругий стук
+    place() {
+      tone({ type: 'sine', f: 185, f2: 62, d: .13, v: .5 });
+      tone({ type: 'triangle', f: 340, f2: 130, d: .05, v: .14 });
+      noise({ f: 480, d: .06, v: .26 });
+    },
+    // 3) Сгорание линий — аккорд-«дзинь», тон растёт с серией
+    clear(streak) {
+      const step = Math.min(Math.max(streak - 1, 0), 7);
+      const base = 523.25 * Math.pow(2, step * 2 / 12); // +2 полутона за серию
+      [1, 1.25, 1.5, 2].forEach((m, i) => {
+        tone({ type: 'triangle', f: base * m, d: .5, v: .2, at: i * .045 });
+        tone({ type: 'sine', f: base * m * 2, d: .34, v: .07, at: i * .045 });
+      });
+      noise({ hp: true, f: 5200, d: .24, v: .05, at: .02 });
+    }
+  };
+})();
+window.addEventListener('pointerdown', () => Sound.unlock(), true);
+
+/* ============================================================
+   ЧАСТИЦЫ — спрайтовые светящиеся искры + объёмные осколки
+   ============================================================ */
+const FX = { glow: [], debris: [], last: 0 };
+const spriteCache = {};
+
+function sprite(color) {
+  if (spriteCache[color]) return spriteCache[color];
+  const s = document.createElement('canvas'); s.width = s.height = 32;
+  const g = s.getContext('2d');
+  const grd = g.createRadialGradient(16, 16, 0, 16, 16, 16);
+  grd.addColorStop(0, '#ffffff');
+  grd.addColorStop(.28, color);
+  grd.addColorStop(1, 'rgba(0,0,0,0)');
+  g.fillStyle = grd;
+  g.fillRect(0, 0, 32, 32);
+  spriteCache[color] = s;
+  return s;
+}
 
 function sizeFx() {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -104,26 +211,36 @@ function sizeFx() {
   fxCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
 
-function spawnBurst(x, y, count, opts = {}) {
-  const pal = SPLASHES[splashId].colors;
-  const base = opts.base || null;
-  const g = opts.gravity !== undefined ? opts.gravity : 520;
-  for (let i = 0; i < count; i++) {
-    const ang = rnd(0, Math.PI * 2);
-    const spd = rnd(60, opts.speed || 250);
-    FX.parts.push({
-      x, y,
-      vx: Math.cos(ang) * spd,
-      vy: Math.sin(ang) * spd - rnd(30, 120),
-      life: 0, ttl: rnd(.45, .95),
-      size: rnd(1.6, opts.maxSize || 4.4),
-      g,
-      col: base && Math.random() < .35 ? lighten(base) : pick(pal)
+function spawnBlockBurst(rect, hex) {
+  const sh = SHADES[hex] || { hex, light: shade(hex, .45), dark: shade(hex, -.32) };
+  const cx = rect.left + rect.width / 2, cy = rect.top + rect.height / 2;
+  const splashPal = SPLASHES[splashId].colors;
+
+  for (let i = 0; i < 34; i++) {
+    const ang = rnd(0, Math.PI * 2), spd = rnd(60, 330);
+    const col = Math.random() < .62 ? hex : pick(splashPal);
+    FX.glow.push({
+      spr: sprite(col),
+      x: cx + rnd(-8, 8), y: cy + rnd(-8, 8),
+      vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd - rnd(60, 170),
+      life: 0, ttl: rnd(.5, 1), size: rnd(8, 18), g: 760
     });
   }
+  for (let i = 0; i < 18; i++) {
+    const ang = rnd(0, Math.PI * 2), spd = rnd(90, 300);
+    FX.debris.push({
+      x: cx + rnd(-6, 6), y: cy + rnd(-6, 6),
+      vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd - rnd(40, 150),
+      life: 0, ttl: rnd(.4, .75), size: rnd(3, 6.5),
+      rot: rnd(0, Math.PI), vr: rnd(-9, 9), g: 980,
+      col: pick([hex, sh.light, sh.dark])
+    });
+  }
+  if (FX.glow.length > 1400) FX.glow.splice(0, FX.glow.length - 1400);
+  if (FX.debris.length > 800) FX.debris.splice(0, FX.debris.length - 800);
 }
 
-/* Мини-превью в магазине */
+/* Мини-превью магазина */
 const previews = [];
 function buildPreviews() {
   previews.length = 0;
@@ -131,41 +248,46 @@ function buildPreviews() {
     previews.push({ cv, ctx: cv.getContext('2d'), parts: [], next: 0, pal: SPLASHES[cv.dataset.s].colors });
   });
 }
-function previewBurst(p) {
-  const w = p.cv.clientWidth, h = p.cv.clientHeight;
-  const x = rnd(w * .25, w * .75), y = h * .62;
-  for (let i = 0; i < 16; i++) {
-    const ang = rnd(0, Math.PI * 2), spd = rnd(30, 130);
-    p.parts.push({
-      x, y, vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd - rnd(20, 80),
-      life: 0, ttl: rnd(.4, .8), size: rnd(1, 2.6), g: 240, col: pick(p.pal)
-    });
-  }
-}
 
 function fxLoop(t) {
   const dt = Math.min(.033, (t - FX.last) / 1000 || .016);
   FX.last = t;
   fxCtx.clearRect(0, 0, innerWidth, innerHeight);
 
-  if (FX.parts.length) {
-    fxCtx.globalCompositeOperation = 'lighter';
-    for (let i = FX.parts.length - 1; i >= 0; i--) {
-      const p = FX.parts[i];
+  // Осколки (обычный режим)
+  if (FX.debris.length) {
+    for (let i = FX.debris.length - 1; i >= 0; i--) {
+      const p = FX.debris[i];
       p.life += dt;
-      if (p.life >= p.ttl) { FX.parts.splice(i, 1); continue; }
-      p.vy += p.g * dt; p.x += p.vx * dt; p.y += p.vy * dt;
-      const a = 1 - p.life / p.ttl;
-      fxCtx.globalAlpha = a;
-      fxCtx.shadowColor = p.col;
-      fxCtx.shadowBlur = p.size * 4;
+      if (p.life >= p.ttl) { FX.debris.splice(i, 1); continue; }
+      p.vy += p.g * dt; p.x += p.vx * dt; p.y += p.vy * dt; p.rot += p.vr * dt;
+      fxCtx.globalAlpha = 1 - p.life / p.ttl;
+      fxCtx.save();
+      fxCtx.translate(p.x, p.y); fxCtx.rotate(p.rot);
       fxCtx.fillStyle = p.col;
-      fxCtx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+      fxCtx.fillRect(-p.size / 2, -p.size / 2, p.size, p.size);
+      fxCtx.restore();
     }
-    fxCtx.globalAlpha = 1; fxCtx.shadowBlur = 0;
+    fxCtx.globalAlpha = 1;
+  }
+  // Светящиеся искры (аддитив)
+  if (FX.glow.length) {
+    fxCtx.globalCompositeOperation = 'lighter';
+    for (let i = FX.glow.length - 1; i >= 0; i--) {
+      const p = FX.glow[i];
+      p.life += dt;
+      if (p.life >= p.ttl) { FX.glow.splice(i, 1); continue; }
+      p.vy += p.g * dt; p.x += p.vx * dt; p.y += p.vy * dt;
+      const k = 1 - p.life / p.ttl;
+      fxCtx.globalAlpha = k;
+      const s = p.size * (.7 + .3 * k);
+      fxCtx.drawImage(p.spr, p.x - s / 2, p.y - s / 2, s, s);
+    }
+    fxCtx.globalAlpha = 1;
     fxCtx.globalCompositeOperation = 'source-over';
   }
 
+  // Анимированные превью в магазине
   if (shopOpen && previews.length) {
     for (const p of previews) {
       const w = p.cv.clientWidth, h = p.cv.clientHeight;
@@ -174,7 +296,19 @@ function fxLoop(t) {
       if (p.cv.width !== w * dpr) { p.cv.width = w * dpr; p.cv.height = h * dpr; }
       p.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       p.ctx.clearRect(0, 0, w, h);
-      if (t > p.next) { previewBurst(p); p.next = t + rnd(600, 1100); }
+      if (t > p.next) {
+        const bx = rnd(w * .25, w * .75), by = h * .62;
+        for (let i = 0; i < 16; i++) {
+          const ang = rnd(0, Math.PI * 2), spd = rnd(30, 130);
+          p.parts.push({
+            spr: sprite(pick(p.pal)),
+            x: bx, y: by,
+            vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd - rnd(20, 80),
+            life: 0, ttl: rnd(.4, .8), size: rnd(5, 11), g: 240
+          });
+        }
+        p.next = t + rnd(600, 1100);
+      }
       p.ctx.globalCompositeOperation = 'lighter';
       for (let i = p.parts.length - 1; i >= 0; i--) {
         const q = p.parts[i];
@@ -182,26 +316,25 @@ function fxLoop(t) {
         if (q.life >= q.ttl) { p.parts.splice(i, 1); continue; }
         q.vy += q.g * dt; q.x += q.vx * dt; q.y += q.vy * dt;
         p.ctx.globalAlpha = 1 - q.life / q.ttl;
-        p.ctx.shadowColor = q.col; p.ctx.shadowBlur = q.size * 4;
-        p.ctx.fillStyle = q.col;
-        p.ctx.fillRect(q.x - q.size / 2, q.y - q.size / 2, q.size, q.size);
+        const s = q.size;
+        p.ctx.drawImage(q.spr, q.x - s / 2, q.y - s / 2, s, s);
       }
-      p.ctx.globalAlpha = 1; p.ctx.shadowBlur = 0;
+      p.ctx.globalAlpha = 1;
       p.ctx.globalCompositeOperation = 'source-over';
     }
   }
   requestAnimationFrame(fxLoop);
 }
 
-/* ---------- ТРЯСКА ---------- */
-function shake(mag) {
+/* ---------- ТРЯСКА ЭКРАНА ---------- */
+function shake(mag, dur = 320) {
   if (shakeRaf) cancelAnimationFrame(shakeRaf);
-  const dur = 320, start = performance.now();
+  const start = performance.now();
   const step = t => {
     const k = (t - start) / dur;
     if (k >= 1) { stage.style.transform = ''; shakeRaf = null; return; }
     const d = mag * (1 - k);
-    stage.style.transform = `translate(${rnd(-d, d)}px, ${rnd(-d, d)}px)`;
+    stage.style.transform = `translate3d(${rnd(-d, d)}px, ${rnd(-d, d)}px, 0)`;
     shakeRaf = requestAnimationFrame(step);
   };
   shakeRaf = requestAnimationFrame(step);
@@ -248,7 +381,7 @@ function anyFit(m) {
 
 function renderCell(r, c) {
   const el = cells[r][c], v = grid[r][c];
-  if (v) { el.classList.add('filled'); el.style.background = v; }
+  if (v) { el.classList.add('filled'); el.style.background = gradOf(v); }
   else { el.classList.remove('filled', 'clearing'); el.style.background = ''; }
 }
 
@@ -263,14 +396,19 @@ function buildPieceDom(piece, cellPx, gapPx) {
   for (const row of m)
     for (const v of row) {
       const b = document.createElement('div');
-      if (v) { b.className = 'blk'; b.style.background = piece.color; }
+      if (v) { b.className = 'blk'; b.style.background = gradOf(piece.color); }
       el.appendChild(b);
     }
   return el;
 }
 
-function randomPiece() {
-  return { shape: pickWeighted(), color: pick(PALETTE) };
+function randomPiece() { return { shape: pickWeighted(), color: pick(PALETTE) }; }
+function pickWeighted() {
+  let total = 0;
+  for (const s of SHAPES) total += s.w;
+  let t = Math.random() * total;
+  for (const s of SHAPES) { t -= s.w; if (t <= 0) return s.m; }
+  return SHAPES[0].m;
 }
 
 function newRound() {
@@ -295,6 +433,7 @@ function renderTray() {
 
 /* ---------- ПРОЕКЦИЯ ---------- */
 let pvCells = [];
+function hexToRgba(hex, a) { return `rgba(${hexToRgb(hex).join(',')},${a})`; }
 function showPreview(m, r, c, color) {
   clearPreview();
   for (let i = 0; i < m.length; i++)
@@ -305,17 +444,17 @@ function showPreview(m, r, c, color) {
         d.style.width = d.style.height = metrics.cell + 'px';
         d.style.left = (c + j) * (metrics.cell + GAP) + 'px';
         d.style.top = (r + i) * (metrics.cell + GAP) + 'px';
-        d.style.background = color;
+        d.style.background = `linear-gradient(180deg, ${hexToRgba(color, .7)}, ${hexToRgba(color, .45)})`;
+        d.style.setProperty('--pv-glow', hexToRgba(color, .55));
         previewLayer.appendChild(d);
         pvCells.push(d);
       }
 }
-function clearPreview() {
-  pvCells.forEach(d => d.remove());
-  pvCells = [];
-}
+function clearPreview() { pvCells.forEach(d => d.remove()); pvCells = []; }
 
-/* ---------- DRAG & DROP ---------- */
+/* ============================================================
+   DRAG & DROP — только transform: translate3d (без reflow)
+   ============================================================ */
 function onSlotDown(e) {
   if (!boardOpen) return;
   const slot = e.currentTarget;
@@ -323,13 +462,14 @@ function onSlotDown(e) {
   const p = pieces[i];
   if (!p) return;
   e.preventDefault();
+  Sound.pickup();
 
   const ghost = buildPieceDom(p, metrics.cell, GAP);
   ghost.classList.add('drag-piece');
   dragLayer.appendChild(ghost);
   const pw = ghost.offsetWidth, ph = ghost.offsetHeight;
 
-  drag = { i, piece: p, ghost, pw, ph, valid: false, r: 0, c: 0, slot };
+  drag = { i, piece: p, ghost, pw, ph, valid: false, r: 0, c: 0, slot, lastKey: '', lift: 30, transform: '' };
   slot.style.opacity = '.25';
   moveDrag(e.clientX, e.clientY);
 
@@ -340,20 +480,24 @@ function onSlotDown(e) {
 
 function moveDrag(x, y) {
   if (!drag) return;
-  const gx = Math.round((x - drag.pw / 2 - metrics.left) / (metrics.cell + GAP));
-  const gy = Math.round((y - drag.ph - 26 - metrics.top) / (metrics.cell + GAP));
-  if (canPlace(drag.piece.shape, gy, gx)) {
-    drag.valid = true; drag.r = gy; drag.c = gx;
-    drag.ghost.style.left = metrics.left + gx * (metrics.cell + GAP) + 'px';
-    drag.ghost.style.top = metrics.top + gy * (metrics.cell + GAP) + 'px';
-    drag.ghost.classList.add('snapped');
-    showPreview(drag.piece.shape, gy, gx, drag.piece.color);
-  } else {
-    drag.valid = false;
-    drag.ghost.style.left = x - drag.pw / 2 + 'px';
-    drag.ghost.style.top = y - drag.ph - 26 + 'px';
-    drag.ghost.classList.remove('snapped');
-    clearPreview();
+  const tx = x - drag.pw / 2;
+  const ty = y - drag.ph - drag.lift;
+  // Фигура увеличена на 1.1 и висит прямо над пальцем
+  drag.transform = `translate3d(${tx}px, ${ty}px, 0) scale(1.1)`;
+  drag.ghost.style.transform = drag.transform;
+
+  const gx = Math.round((tx - metrics.left) / (metrics.cell + GAP));
+  const gy = Math.round((ty - metrics.top) / (metrics.cell + GAP));
+  const key = gx + ',' + gy;
+  if (key !== drag.lastKey) {
+    drag.lastKey = key;
+    if (canPlace(drag.piece.shape, gy, gx)) {
+      drag.valid = true; drag.r = gy; drag.c = gx;
+      showPreview(drag.piece.shape, gy, gx, drag.piece.color);
+    } else {
+      drag.valid = false;
+      clearPreview();
+    }
   }
 }
 
@@ -364,9 +508,12 @@ function onDragUp() {
   const d = drag;
   clearPreview();
   if (d.valid) {
-    placePiece(d.i, d.r, d.c);
     d.ghost.remove();
-    cleanupDrag();
+    drag = null;
+    window.removeEventListener('pointermove', onDragMove);
+    window.removeEventListener('pointerup', onDragUp);
+    window.removeEventListener('pointercancel', onDragCancel);
+    placePiece(d.i, d.r, d.c);
   } else {
     returnGhost(d);
   }
@@ -380,14 +527,20 @@ function onDragCancel() {
 
 function returnGhost(d) {
   const rect = d.slot.getBoundingClientRect();
-  d.ghost.classList.add('returning');
-  d.ghost.style.left = rect.left + rect.width / 2 - d.pw / 2 + 'px';
-  d.ghost.style.top = rect.top + rect.height / 2 - d.ph / 2 + 'px';
-  d.ghost.style.transform = 'scale(.5)';
-  d.ghost.style.opacity = '.25';
+  const ftx = rect.left + rect.width / 2 - d.pw / 2;
+  const fty = rect.top + rect.height / 2 - d.ph / 2;
   d.slot.style.opacity = '';
-  setTimeout(() => d.ghost.remove(), 230);
+  d.ghost.animate(
+    [
+      { transform: d.transform, opacity: 1 },
+      { transform: `translate3d(${ftx}px, ${fty}px, 0) scale(.55)`, opacity: .15 }
+    ],
+    { duration: 220, easing: 'cubic-bezier(.3,.7,.4,1)' }
+  ).onfinish = () => d.ghost.remove();
   drag = null;
+  window.removeEventListener('pointermove', onDragMove);
+  window.removeEventListener('pointerup', onDragUp);
+  window.removeEventListener('pointercancel', onDragCancel);
 }
 
 function cleanupDrag() {
@@ -400,8 +553,8 @@ function cleanupDrag() {
 /* ---------- РАЗМЕЩЕНИЕ И ОЧКИ ---------- */
 function placePiece(i, r, c) {
   const p = pieces[i];
-  let n = 0;
   const m = p.shape;
+  let n = 0;
   for (let a = 0; a < m.length; a++)
     for (let b = 0; b < m[a].length; b++)
       if (m[a][b]) { grid[r + a][c + b] = p.color; n++; }
@@ -420,6 +573,7 @@ function placePiece(i, r, c) {
         el.classList.add('pop');
       }
 
+  Sound.place();
   addScore(n);
   resolve();
 
@@ -431,7 +585,11 @@ function placePiece(i, r, c) {
 function resolve() {
   const rows = [], cols = [];
   for (let r = 0; r < SIZE; r++) if (grid[r].every(Boolean)) rows.push(r);
-  for (let c = 0; c < SIZE; c++) { let f = true; for (let r = 0; r < SIZE; r++) if (!grid[r][c]) { f = false; break; } if (f) cols.push(c); }
+  for (let c = 0; c < SIZE; c++) {
+    let f = true;
+    for (let r = 0; r < SIZE; r++) if (!grid[r][c]) { f = false; break; }
+    if (f) cols.push(c);
+  }
   const n = rows.length + cols.length;
   if (!n) { streak = 0; return; }
 
@@ -443,13 +601,15 @@ function resolve() {
   clearSet.forEach(idx => {
     const r = (idx / SIZE) | 0, c = idx % SIZE;
     const el = cells[r][c];
-    const rect = el.getBoundingClientRect();
-    spawnBurst(rect.left + rect.width / 2, rect.top + rect.height / 2, 12, { base: grid[r][c] });
+    spawnBlockBurst(el.getBoundingClientRect(), grid[r][c]);
     grid[r][c] = null;
     el.classList.remove('pop');
     el.classList.add('clearing');
     setTimeout(() => renderCell(r, c), 240);
   });
+
+  boardFlash();
+  Sound.clear(streak);
 
   const pts = (80 * n + (n - 1) * 40) * Math.min(streak, 5);
   addScore(pts);
@@ -461,14 +621,50 @@ function resolve() {
   flyCoins(gain);
   updateHUD();
 
-  shake(4 + n * 2.5);
+  shake(3 + n * 3, 300 + n * 40);
   if (n >= 2) vibrate(15);
 
-  const texts = n >= 4 ? ['ЛЕГЕНДА!']
-    : n === 3 ? ['ЩЕРБАКОК МОЩЬ!', 'ЛЕГЕНДА!']
-    : streak >= 3 ? ['ДАНИЛА ЛУЧШИЙ!', 'ЩЕРБАКОК МОЩЬ!']
-    : ['ДАНИЛА ЛУЧШИЙ!'];
-  showCombo(pick(texts));
+  // ИМЕННЫЕ ПЛАШКИ
+  if (n === 1) {
+    lineToast('ДАНИЛА ТАЩИТ!');
+  } else {
+    const TIERS = ['ДАНИЛА ЩЕРБАКОВ — ЛУЧШИЙ!', 'ЩЕРБАКОК МОЩЬ!', 'ЛЕГЕНДА!'];
+    let t = n >= 4 ? 2 : n - 2;
+    if (streak >= 3) t = Math.min(2, t + 1);
+    comboBanner(TIERS[t], `КОМБО ×${n}`);
+  }
+}
+
+/* ---------- ПЛАШКИ И ЭФФЕКТЫ ---------- */
+function comboBanner(text, sub) {
+  comboPlate.innerHTML = `<span class="cp-main">${text}</span>` +
+    (sub ? `<span class="cp-sub">${sub}</span>` : '');
+  comboPlate.classList.remove('show'); void comboPlate.offsetWidth;
+  comboPlate.classList.add('show');
+}
+
+function lineToast(text) {
+  const el = document.createElement('div');
+  el.className = 'line-toast';
+  el.textContent = text;
+  boardInner.appendChild(el);
+  el.animate(
+    [
+      { transform: 'translate(-50%, 12px) scale(.6)', opacity: 0 },
+      { transform: 'translate(-50%, 0) scale(1.08)', opacity: 1, offset: .25 },
+      { transform: 'translate(-50%, -8px) scale(1)', opacity: 1, offset: .7 },
+      { transform: 'translate(-50%, -30px) scale(1)', opacity: 0 }
+    ],
+    { duration: 950, easing: 'cubic-bezier(.2,.8,.3,1)' }
+  ).onfinish = () => el.remove();
+}
+
+function boardFlash() {
+  const f = document.createElement('div');
+  f.className = 'board-flash';
+  boardInner.appendChild(f);
+  f.animate([{ opacity: .5 }, { opacity: 0 }], { duration: 320, easing: 'ease-out' })
+    .onfinish = () => f.remove();
 }
 
 function addScore(v) {
@@ -480,24 +676,17 @@ function addScore(v) {
   $('bestVal').textContent = best;
 }
 
-function showCombo(text) {
-  comboPlate.textContent = text;
-  comboPlate.classList.remove('show'); void comboPlate.offsetWidth;
-  comboPlate.classList.add('show');
-}
-
 function floatPts(text) {
   const el = document.createElement('div');
   el.className = 'float-pts';
   el.textContent = text;
   document.body.appendChild(el);
   const r = boardWrap.getBoundingClientRect();
-  const x = r.left + r.width / 2, y = r.top + r.height * .16;
   el.animate(
     [
-      { transform: `translate(-50%,-50%) scale(.5)`, opacity: 0 },
-      { transform: `translate(-50%,-50%) scale(1.15)`, opacity: 1, offset: .25 },
-      { transform: `translate(-50%,-150%) scale(1)`, opacity: 0 }
+      { transform: `translate(${r.left + r.width / 2}px, ${r.top + r.height * .16}px) translate(-50%,-50%) scale(.5)`, opacity: 0 },
+      { transform: `translate(${r.left + r.width / 2}px, ${r.top + r.height * .16}px) translate(-50%,-50%) scale(1.15)`, opacity: 1, offset: .25 },
+      { transform: `translate(${r.left + r.width / 2}px, ${r.top + r.height * .04}px) translate(-50%,-50%) scale(1)`, opacity: 0 }
     ],
     { duration: 950, easing: 'cubic-bezier(.2,.8,.3,1)' }
   ).onfinish = () => el.remove();
@@ -603,7 +792,10 @@ function renderShop() {
     } else if (isOwned) {
       btn.classList.add('select');
       btn.textContent = 'ВЫБРАТЬ';
-      btn.addEventListener('click', () => { splashId = id; store.set('splash', id); renderShop(); toast('Эффект применён'); });
+      btn.addEventListener('click', () => {
+        splashId = id; store.set('splash', id);
+        renderShop(); toast('Эффект применён');
+      });
     } else {
       btn.classList.add('buy', 'btn-glass');
       btn.innerHTML = `КУПИТЬ ${s.price} ${COIN_SVG}`;
@@ -615,7 +807,15 @@ function renderShop() {
         store.set('coins', coins); store.set('owned', owned); store.set('splash', id);
         updateHUD(); renderShop(); buildPreviews();
         const r = btn.getBoundingClientRect();
-        spawnBurst(r.left + r.width / 2, r.top, 18, { speed: 160 });
+        for (let i = 0; i < 20; i++) {
+          const ang = rnd(0, Math.PI * 2), spd = rnd(40, 170);
+          FX.glow.push({
+            spr: sprite(pick(SPLASHES[id].colors)),
+            x: r.left + r.width / 2, y: r.top + r.height / 2,
+            vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd - 60,
+            life: 0, ttl: rnd(.4, .8), size: rnd(6, 13), g: 500
+          });
+        }
         toast('Куплено: ' + s.name);
       });
     }
@@ -681,7 +881,10 @@ function bindUI() {
   slots.forEach(s => s.addEventListener('pointerdown', onSlotDown));
   document.addEventListener('contextmenu', e => { if (boardOpen) e.preventDefault(); });
 
-  $('btnPlay').addEventListener('click', () => { showScreen('gameScreen'); requestAnimationFrame(() => { measure(); startGame(); }); });
+  $('btnPlay').addEventListener('click', () => {
+    showScreen('gameScreen');
+    requestAnimationFrame(() => { measure(); startGame(); });
+  });
   $('btnBack').addEventListener('click', () => { if (boardOpen) $('pauseOverlay').classList.remove('hidden'); });
   $('btnResume').addEventListener('click', () => $('pauseOverlay').classList.add('hidden'));
   $('btnRestartPause').addEventListener('click', () => { closeOverlays(); startGame(); });
