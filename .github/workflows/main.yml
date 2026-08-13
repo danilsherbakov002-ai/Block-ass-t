@@ -10,8 +10,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
 
       - name: Setup Java JDK
         uses: actions/setup-java@v3
@@ -19,14 +24,20 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Build APK with Bubblewrap / TWA
+      - name: Install Cordova & Build APK
         run: |
-          npm install -g @bubblewrap/cli
-          echo "Building Web App to APK..."
+          npm install -g cordova
+          cordova create build_app com.danila.blockblast "DanilaBest"
+          cp -r index.html style.css game.js build_app/www/ 2>/dev/null || true
+          # Копируем абсолютно все файлы из корня в папку сборки
+          cp -r * build_app/www/ 2>/dev/null || true
+          cd build_app
+          cordova platform add android
+          cordova build android --no-telemetry
 
-      - name: Upload APK Artifact
-        uses: actions/upload-artifact@v3
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
         with:
-          name: BlockBlast-DanilaBest-APK
-          path: ./*.apk
+          name: Danila-BlockBlast-APK
+          path: build_app/platforms/android/app/build/outputs/apk/debug/app-debug.apk
           
